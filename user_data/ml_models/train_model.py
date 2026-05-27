@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# train_model.py — Anti-Leakage v2
+# train_model.py — Anti-Leakage v3 — Feature names alineados con producción
 # ─────────────────────────────────────────────────────────────────────────────
 
 import pandas as pd
@@ -22,16 +22,28 @@ MODEL_PATH    = USERDATA_PATH / "ml_models" / "smc_ml_model.pkl"
 SCALER_PATH   = USERDATA_PATH / "ml_models" / "smc_ml_scaler.pkl"
 PAIR          = "BTC_USDT"
 
+# ── Fuente única de verdad — nombres exactos de producción (con sufijo _1h) ──
 FEATURE_COLS = [
-    'htf_bias', 'htf_ema20_50_dist', 'htf_ema50_200_dist',
-    'htf_price_ema200_dist',
-    'dist_to_ob', 'ob_size', 'ob_age',
-    'dist_to_fvg', 'fvg_size',
-    'dist_to_swing_high', 'dist_to_swing_low',
-    'volume_ratio', 'volume_zscore',
-    'atr_norm', 'atr_ratio', 'bb_width',
-    'rsi', 'macd_hist',
-    'in_kill_zone', 'bos_bullish',
+    'htf_bias_1h',
+    'htf_ema20_50_dist_1h',
+    'htf_ema50_200_dist_1h',
+    'htf_price_ema200_dist_1h',
+    'dist_to_ob',
+    'ob_size',
+    'ob_age',
+    'dist_to_fvg',
+    'fvg_size',
+    'dist_to_swing_high',
+    'dist_to_swing_low',
+    'volume_ratio',
+    'volume_zscore',
+    'atr_norm',
+    'atr_ratio',
+    'bb_width',
+    'rsi',
+    'macd_hist',
+    'in_kill_zone',
+    'bos_bullish',
 ]
 
 def load_backtest_trades() -> pd.DataFrame:
@@ -62,6 +74,7 @@ def compute_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
 
     df = df_15m.copy()
 
+    # ── Indicadores 15m ───────────────────────────────────────────────────────
     df["rsi"]       = ta_lib.momentum.rsi(df["close"], window=14)
     macd            = ta_lib.trend.MACD(df["close"])
     df["macd_hist"] = macd.macd_diff()
@@ -88,11 +101,10 @@ def compute_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
         (df["close"].shift(1) <= df["last_swing_high"].shift(1))
     ).astype(int)
 
-    # ✅ Order Blocks — impulso ya ocurrió (sin shift(-1))
+    # ✅ Order Blocks — impulso ya ocurrió
     body     = abs(df["close"] - df["open"])
     avg_body = body.rolling(20).mean()
     impulse  = body > avg_body * 1.5
-
     df["ob_bullish"] = (
         (df["close"].shift(1) < df["open"].shift(1)) &
         impulse &
@@ -101,7 +113,7 @@ def compute_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
     df["ob_bull_top"]    = df["open"].shift(1).where(df["ob_bullish"] == 1).ffill()
     df["ob_bull_bottom"] = df["close"].shift(1).where(df["ob_bullish"] == 1).ffill()
 
-    # ✅ FVG — confirmado con velas pasadas (sin shift(-1))
+    # ✅ FVG — confirmado con velas pasadas
     df["fvg_bullish"]     = (df["high"].shift(2) < df["low"]).astype(int)
     df["fvg_bull_top"]    = df["low"].where(df["fvg_bullish"] == 1).ffill()
     df["fvg_bull_bottom"] = df["high"].shift(2).where(df["fvg_bullish"] == 1).ffill()
@@ -128,33 +140,38 @@ def compute_features(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> pd.DataFrame:
         ob_age.append(i - last_ob if not np.isnan(last_ob) else 999)
     df["ob_age"] = ob_age
 
-    # HTF merge
+    # ── HTF merge — nombres con sufijo _1h igual que producción ──────────────
     df_1h = df_1h.copy()
     df_1h["ema_20_1h"]  = ta_lib.trend.ema_indicator(df_1h["close"], window=20)
     df_1h["ema_50_1h"]  = ta_lib.trend.ema_indicator(df_1h["close"], window=50)
     df_1h["ema_200_1h"] = ta_lib.trend.ema_indicator(df_1h["close"], window=200)
-    df_1h["atr_1h"]     = ta_lib.volatility.average_true_range(
+    df_1h["atr_1h_1h"]  = ta_lib.volatility.average_true_range(
         df_1h["high"], df_1h["low"], df_1h["close"], window=14)
-    df_1h["htf_bias"] = 0
+
+    df_1h["htf_bias_1h"] = 0
     df_1h.loc[
         (df_1h["ema_20_1h"] > df_1h["ema_50_1h"]) &
-        (df_1h["ema_50_1h"] > df_1h["ema_200_1h"]), "htf_bias"] = 1
+        (df_1h["ema_50_1h"] > df_1h["ema_200_1h"]), "htf_bias_1h"] = 1
     df_1h.loc[
         (df_1h["ema_20_1h"] < df_1h["ema_50_1h"]) &
-        (df_1h["ema_50_1h"] < df_1h["ema_200_1h"]), "htf_bias"] = -1
-    df_1h["htf_ema20_50_dist"]     = (df_1h["ema_20_1h"] - df_1h["ema_50_1h"]) / df_1h["ema_50_1h"]
-    df_1h["htf_ema50_200_dist"]    = (df_1h["ema_50_1h"] - df_1h["ema_200_1h"]) / df_1h["ema_200_1h"]
-    df_1h["htf_price_ema200_dist"] = (df_1h["close"] - df_1h["ema_200_1h"]) / df_1h["ema_200_1h"]
+        (df_1h["ema_50_1h"] < df_1h["ema_200_1h"]), "htf_bias_1h"] = -1
+
+    df_1h["htf_ema20_50_dist_1h"]     = (df_1h["ema_20_1h"] - df_1h["ema_50_1h"]) / df_1h["ema_50_1h"]
+    df_1h["htf_ema50_200_dist_1h"]    = (df_1h["ema_50_1h"] - df_1h["ema_200_1h"]) / df_1h["ema_200_1h"]
+    df_1h["htf_price_ema200_dist_1h"] = (df_1h["close"] - df_1h["ema_200_1h"]) / df_1h["ema_200_1h"]
 
     df = pd.merge_asof(
         df.sort_values("date"),
-        df_1h[["date","atr_1h","htf_bias","htf_ema20_50_dist",
-               "htf_ema50_200_dist","htf_price_ema200_dist"]].sort_values("date"),
+        df_1h[["date", "atr_1h_1h", "htf_bias_1h",
+               "htf_ema20_50_dist_1h", "htf_ema50_200_dist_1h",
+               "htf_price_ema200_dist_1h"]].sort_values("date"),
         on="date", direction="backward"
     )
-    df["atr_ratio"] = df["atr"] / df["atr_1h"].replace(0, np.nan)
 
-    return df.dropna(subset=["rsi", "atr", "htf_bias"])
+    # atr_ratio usando nombre de producción
+    df["atr_ratio"] = df["atr"] / df["atr_1h_1h"].replace(0, np.nan)
+
+    return df.dropna(subset=["rsi", "atr", "htf_bias_1h"])
 
 def build_training_set(trades, features_df):
     trades = trades.copy()
@@ -176,7 +193,7 @@ def build_training_set(trades, features_df):
         rows.append(row)
 
     df_train = pd.DataFrame(rows).sort_values("open_date")
-    print(f"\n📊 Dataset: {len(df_train)} muestras | ROI: {df_train['target'].sum()} | No-ROI: {(df_train['target']==0).sum()} | Balance: {df_train['target'].mean():.1%}")
+    print(f"\n📊 Dataset: {len(df_train)} | ROI: {df_train['target'].sum()} | No-ROI: {(df_train['target']==0).sum()} | Balance: {df_train['target'].mean():.1%}")
     return df_train[FEATURE_COLS].fillna(0), df_train["target"], df_train["open_date"]
 
 def train_model(X, y, dates):
@@ -189,14 +206,16 @@ def train_model(X, y, dates):
         ytr, yte = y.iloc[tr], y.iloc[te]
         pw = (ytr==0).sum() / max((ytr==1).sum(), 1)
 
-        m = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=4,
-                               subsample=0.8, colsample_bytree=0.8,
-                               scale_pos_weight=pw, eval_metric="logloss",
-                               random_state=42, verbosity=0)
+        m = xgb.XGBClassifier(
+            n_estimators=300, learning_rate=0.05, max_depth=4,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=pw, eval_metric="logloss",
+            random_state=42, verbosity=0
+        )
         m.fit(Xtr, ytr, eval_set=[(Xte, yte)], verbose=False)
 
-        yp   = m.predict_proba(Xte)[:, 1]
-        auc  = roc_auc_score(yte, yp)
+        yp  = m.predict_proba(Xte)[:, 1]
+        auc = roc_auc_score(yte, yp)
         fold_aucs.append(auc)
         print(f"\n  Fold {fold+1} — AUC: {auc:.3f}")
         print(classification_report(yte, (yp>=0.60).astype(int),
@@ -204,13 +223,14 @@ def train_model(X, y, dates):
 
     print(f"\n📈 AUC promedio: {np.mean(fold_aucs):.3f} ± {np.std(fold_aucs):.3f}")
 
-    # Modelo final
     Xf = scaler.fit_transform(X)
     pw = (y==0).sum() / max((y==1).sum(), 1)
-    final = xgb.XGBClassifier(n_estimators=300, learning_rate=0.05, max_depth=4,
-                               subsample=0.8, colsample_bytree=0.8,
-                               scale_pos_weight=pw, eval_metric="logloss",
-                               random_state=42, verbosity=0)
+    final = xgb.XGBClassifier(
+        n_estimators=300, learning_rate=0.05, max_depth=4,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=pw, eval_metric="logloss",
+        random_state=42, verbosity=0
+    )
     final.fit(Xf, y)
 
     imp = pd.Series(final.feature_importances_, index=FEATURE_COLS).sort_values(ascending=False)
@@ -225,7 +245,7 @@ def train_model(X, y, dates):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  SMC ML Model Trainer — Anti-Leakage v2")
+    print("  SMC ML Model Trainer — v3 — Feature alignment fix")
     print("=" * 60)
     trades        = load_backtest_trades()
     df_15m, df_1h = load_ohlcv()
@@ -236,4 +256,4 @@ if __name__ == "__main__":
         print(f"⚠️  Solo {len(X)} trades. Mínimo recomendado: 100.")
     else:
         train_model(X, y, dates)
-        print("\n🎯 Listo. Ahora corre el backtest con el modelo actualizado.")
+        print("\n🎯 Listo. Corre el backtest para ver el impacto real del filtro ML.")

@@ -1,6 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SMC_ML_Strategy.py
-# Estrategia híbrida: Smart Money Concepts + Filtro ML — Anti-Leakage v2
+# SMC_ML_Strategy.py — Anti-Leakage v3 — Feature alignment fix
 # Exchange: Bybit | Par: BTC/USDT | Timeframe: 15m
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -36,6 +35,19 @@ class SMC_ML_Strategy(IStrategy):
     ml_score_threshold = 0.60
     ml_model = None
     ml_model_path = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_model.pkl')
+
+    # ── Fuente única de verdad — idéntica a train_model.py ───────────────────
+    FEATURE_COLS = [
+        'htf_bias_1h', 'htf_ema20_50_dist_1h',
+        'htf_ema50_200_dist_1h', 'htf_price_ema200_dist_1h',
+        'dist_to_ob', 'ob_size', 'ob_age',
+        'dist_to_fvg', 'fvg_size',
+        'dist_to_swing_high', 'dist_to_swing_low',
+        'volume_ratio', 'volume_zscore',
+        'atr_norm', 'atr_ratio', 'bb_width',
+        'rsi', 'macd_hist',
+        'in_kill_zone', 'bos_bullish',
+    ]
 
     def bot_start(self, **kwargs):
         if os.path.exists(self.ml_model_path):
@@ -164,7 +176,6 @@ class SMC_ML_Strategy(IStrategy):
         ).astype(int)
         df['fvg_bull_bottom'] = df['high'].shift(2).where(df['fvg_bullish'] == 1).ffill()
         df['fvg_bull_top']    = df['low'].where(df['fvg_bullish'] == 1).ffill()
-
         df['fvg_bearish'] = (
             df['low'].shift(2) > df['high']
         ).astype(int)
@@ -190,10 +201,6 @@ class SMC_ML_Strategy(IStrategy):
         return df
 
     def _compute_smc_features(self, df: DataFrame) -> DataFrame:
-        # ── Debug temporal: identificar columnas 1h disponibles ───────────────
-        cols_1h = [c for c in df.columns if '1h' in c]
-        print(f"🔍 Columnas con '1h': {cols_1h}")
-
         df['dist_to_ob'] = (
             (df['close'] - df['ob_bull_top']) / df['close']
         ).fillna(0)
@@ -220,18 +227,10 @@ class SMC_ML_Strategy(IStrategy):
         df['dist_to_swing_low'] = (
             (df['close'] - df['last_swing_low']) / df['close']
         ).fillna(0)
-        df['atr_norm'] = df['atr'] / df['close']
+        df['atr_norm']  = df['atr'] / df['close']
 
-        # ── atr_ratio: usar columna correcta del HTF ─────────────────────────
-        # Freqtrade inyecta columnas del @informative con sufijo _1h
-        # El nombre exacto se imprime arriba para verificación
-        atr_1h_col = 'atr_1h_1h' if 'atr_1h_1h' in df.columns else (
-                     'atr_1h'    if 'atr_1h'    in df.columns else None)
-
-        if atr_1h_col:
-            df['atr_ratio'] = df['atr'] / df[atr_1h_col].replace(0, np.nan).ffill()
-        else:
-            df['atr_ratio'] = 1.0  # fallback neutral
+        # ✅ Nombre correcto de producción: atr_1h_1h
+        df['atr_ratio'] = df['atr'] / df['atr_1h_1h'].replace(0, np.nan).ffill()
 
         return df
 
@@ -239,27 +238,13 @@ class SMC_ML_Strategy(IStrategy):
         df['ml_score'] = 0.5
         if self.ml_model is None:
             return df
-        feature_cols = self._get_feature_cols()
-        features = df[feature_cols].fillna(0)
+        features = df[self.FEATURE_COLS].fillna(0)
         try:
             scores = self.ml_model.predict_proba(features)[:, 1]
             df['ml_score'] = scores
         except Exception as e:
             print(f"⚠️  Error en ML score: {e}")
         return df
-
-    def _get_feature_cols(self) -> list:
-        return [
-            'htf_bias_1h', 'htf_ema20_50_dist_1h',
-            'htf_ema50_200_dist_1h', 'htf_price_ema200_dist_1h',
-            'dist_to_ob', 'ob_size', 'ob_age',
-            'dist_to_fvg', 'fvg_size',
-            'dist_to_swing_high', 'dist_to_swing_low',
-            'volume_ratio', 'volume_zscore',
-            'atr_norm', 'atr_ratio', 'bb_width',
-            'rsi', 'macd_hist',
-            'in_kill_zone', 'bos_bullish',
-        ]
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         ml_filter = (
