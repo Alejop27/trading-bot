@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SMC_ML_Strategy.py — Anti-Leakage v3 — Feature alignment fix
+# SMC_ML_Strategy.py — v4 — Scaler fix + exit_signal repair
 # Exchange: Bybit | Par: BTC/USDT | Timeframe: 15m
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -17,24 +17,36 @@ class SMC_ML_Strategy(IStrategy):
     timeframe = '15m'
     can_short = False
 
+    # ── ROI ampliado para capturar tendencias reales ──────────────────────────
+    # Antes: {0: 0.02, 15: 0.01, 30: 0.005, 60: 0}
+    # Problema: cortaba ganancias a +0.13% mientras las pérdidas llegaban -0.80%
     minimal_roi = {
-        "0":  0.02,
-        "15": 0.01,
-        "30": 0.005,
-        "60": 0
+        "0":   0.06,
+        "60":  0.04,
+        "180": 0.02,
+        "360": 0.01
     }
+
     stoploss = -0.02
     trailing_stop = True
     trailing_stop_positive = 0.01
     trailing_stop_positive_offset = 0.015
     trailing_only_offset_is_reached = True
 
+    # ── exit_signal deshabilitado ─────────────────────────────────────────────
+    # bos_bearish se disparaba demasiado frecuente → 129 trades a -0.80% avg
+    # = -$306 USDT. Reemplazado por lógica estructural más selectiva abajo.
+    use_exit_signal = True
+
     startup_candle_count = 200
     process_only_new_candles = True
 
-    ml_score_threshold = 0.60
-    ml_model = None
-    ml_model_path = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_model.pkl')
+    ml_score_threshold = 0.62
+    ml_model  = None
+    ml_scaler = None  # ← FIX: ahora cargamos el scaler también
+
+    ml_model_path  = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_model.pkl')
+    ml_scaler_path = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_scaler.pkl')
 
     # ── Fuente única de verdad — idéntica a train_model.py ───────────────────
     FEATURE_COLS = [
@@ -50,9 +62,18 @@ class SMC_ML_Strategy(IStrategy):
     ]
 
     def bot_start(self, **kwargs):
-        if os.path.exists(self.ml_model_path):
-            self.ml_model = joblib.load(self.ml_model_path)
+        # ── FIX: cargar scaler junto con el modelo ────────────────────────────
+        model_ok  = os.path.exists(self.ml_model_path)
+        scaler_ok = os.path.exists(self.ml_scaler_path)
+
+        if model_ok and scaler_ok:
+            self.ml_model  = joblib.load(self.ml_model_path)
+            self.ml_scaler = joblib.load(self.ml_scaler_path)
             print(f"✅ Modelo ML cargado: {self.ml_model_path}")
+            print(f"✅ Scaler ML cargado: {self.ml_scaler_path}")
+        elif model_ok and not scaler_ok:
+            print("⚠️  Scaler no encontrado. Operando sin filtro ML.")
+            print(f"   Esperado en: {self.ml_scaler_path}")
         else:
             print("⚠️  Modelo ML no encontrado. Operando sin filtro ML.")
 
@@ -104,10 +125,10 @@ class SMC_ML_Strategy(IStrategy):
             dataframe['high'], dataframe['low'], dataframe['close'], window=14
         )
         bb = ta.volatility.BollingerBands(dataframe['close'], window=20, window_dev=2)
-        dataframe['bb_upper']  = bb.bollinger_hband()
-        dataframe['bb_lower']  = bb.bollinger_lband()
-        dataframe['bb_mid']    = bb.bollinger_mavg()
-        dataframe['bb_width']  = (dataframe['bb_upper'] - dataframe['bb_lower']) / dataframe['bb_mid']
+        dataframe['bb_upper'] = bb.bollinger_hband()
+        dataframe['bb_lower'] = bb.bollinger_lband()
+        dataframe['bb_mid']   = bb.bollinger_mavg()
+        dataframe['bb_width'] = (dataframe['bb_upper'] - dataframe['bb_lower']) / dataframe['bb_mid']
 
         dataframe['volume_ma_20'] = dataframe['volume'].rolling(20).mean()
         dataframe['volume_ratio'] = dataframe['volume'] / dataframe['volume_ma_20']
@@ -171,14 +192,10 @@ class SMC_ML_Strategy(IStrategy):
         return df
 
     def _detect_fvg(self, df: DataFrame) -> DataFrame:
-        df['fvg_bullish'] = (
-            df['high'].shift(2) < df['low']
-        ).astype(int)
+        df['fvg_bullish']     = (df['high'].shift(2) < df['low']).astype(int)
         df['fvg_bull_bottom'] = df['high'].shift(2).where(df['fvg_bullish'] == 1).ffill()
         df['fvg_bull_top']    = df['low'].where(df['fvg_bullish'] == 1).ffill()
-        df['fvg_bearish'] = (
-            df['low'].shift(2) > df['high']
-        ).astype(int)
+        df['fvg_bearish']     = (df['low'].shift(2) > df['high']).astype(int)
         return df
 
     def _detect_liquidity(self, df: DataFrame, tolerance: float = 0.001) -> DataFrame:
@@ -196,7 +213,7 @@ class SMC_ML_Strategy(IStrategy):
             ((hour >= 7) & (hour < 10)) |
             ((hour >= 12) & (hour < 15))
         ).astype(int)
-        df['london_open'] = ((hour >= 7) & (hour < 10)).astype(int)
+        df['london_open'] = ((hour >= 7)  & (hour < 10)).astype(int)
         df['ny_open']     = ((hour >= 12) & (hour < 15)).astype(int)
         return df
 
@@ -228,36 +245,45 @@ class SMC_ML_Strategy(IStrategy):
             (df['close'] - df['last_swing_low']) / df['close']
         ).fillna(0)
         df['atr_norm']  = df['atr'] / df['close']
-
-        # ✅ Nombre correcto de producción: atr_1h_1h
         df['atr_ratio'] = df['atr'] / df['atr_1h_1h'].replace(0, np.nan).ffill()
 
         return df
 
     def _compute_ml_score(self, df: DataFrame) -> DataFrame:
+        # Default neutro — ni filtra ni fuerza entradas
         df['ml_score'] = 0.5
-        if self.ml_model is None:
+
+        if self.ml_model is None or self.ml_scaler is None:
             return df
-        features = df[self.FEATURE_COLS].fillna(0)
+
         try:
-            scores = self.ml_model.predict_proba(features)[:, 1]
-            df['ml_score'] = scores
+            features = df[self.FEATURE_COLS].fillna(0)
+            # ── FIX CRÍTICO: aplicar scaler antes de predict_proba ────────────
+            # Sin esto el modelo recibe datos sin escalar y los scores son
+            # basura → el threshold 0.62 no filtra nada o filtra al azar.
+            features_scaled = self.ml_scaler.transform(features)
+            df['ml_score'] = self.ml_model.predict_proba(features_scaled)[:, 1]
         except Exception as e:
             print(f"⚠️  Error en ML score: {e}")
+
         return df
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        ml_filter = (
-            (dataframe['ml_score'] >= self.ml_score_threshold)
-            if self.ml_model is not None
-            else True
-        )
+        # ── Filtro ML ─────────────────────────────────────────────────────────
+        # Si el modelo+scaler están cargados, aplicar umbral.
+        # Si no, bloquear todas las entradas (fail-safe conservador).
+        if self.ml_model is not None and self.ml_scaler is not None:
+            ml_filter = dataframe['ml_score'] >= self.ml_score_threshold
+        else:
+            # Sin modelo no operamos — evita entrar "a ciegas"
+            ml_filter = False
+
         dataframe.loc[
             (
                 (dataframe['htf_bias_1h'] == 1) &
                 (dataframe['ema_9'] > dataframe['ema_21']) &
-                (dataframe['rsi'] > 25) &
-                (dataframe['rsi'] < 75) &
+                (dataframe['rsi'] > 30) &
+                (dataframe['rsi'] < 70) &
                 (
                     (dataframe['close'] <= dataframe['ob_bull_top']) |
                     (dataframe['close'] <= dataframe['fvg_bull_top']) |
@@ -273,9 +299,13 @@ class SMC_ML_Strategy(IStrategy):
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # ── Exit estructural mejorado ─────────────────────────────────────────
+        # Antes: bos_bearish solo → demasiado frecuente → 129 trades a -0.80%
+        # Ahora: requiere AMBAS condiciones (BOS bearish + HTF bias cambiado)
+        # para salir. Esto deja correr trades buenos en pullbacks normales.
         dataframe.loc[
             (
-                (dataframe['bos_bearish'] == 1) |
+                (dataframe['bos_bearish'] == 1) &
                 (dataframe['htf_bias_1h'] == -1)
             ),
             'exit_long'
