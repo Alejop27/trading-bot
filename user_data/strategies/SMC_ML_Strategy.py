@@ -1,418 +1,261 @@
-# pragma pylint: disable=missing-docstring, invalid-name, pointless-string-statement
-# flake8: noqa: F401
-# isort: skip_file
-# --- Do not remove these imports ---
+# ─────────────────────────────────────────────────────────────────────────────
+# SMC_ML_Strategy.py
+# Estrategia híbrida: Smart Money Concepts + Filtro ML
+# Exchange: Binance | Par: BTC/USDT | Timeframe: 15m
+# ─────────────────────────────────────────────────────────────────────────────
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 from pandas import DataFrame
-from typing import Dict, Optional, Union, Tuple
-
-from freqtrade.strategy import (
-    IStrategy,
-    Trade,
-    Order,
-    PairLocks,
-    informative,  # @informative decorator
-    # Hyperopt Parameters
-    BooleanParameter,
-    CategoricalParameter,
-    DecimalParameter,
-    IntParameter,
-    RealParameter,
-    # timeframe helpers
-    timeframe_to_minutes,
-    timeframe_to_next_date,
-    timeframe_to_prev_date,
-    # Strategy helper functions
-    merge_informative_pair,
-    stoploss_from_absolute,
-    stoploss_from_open,
-    AnnotationType,
-)
-
-# --------------------------------
-# Add your lib to import here
-import talib.abstract as ta
-from technical import qtpylib
-
+from freqtrade.strategy import IStrategy, informative
+import ta
 
 class SMC_ML_Strategy(IStrategy):
     """
-    This is a strategy template to get you started.
-    More information in https://www.freqtrade.io/en/stable/strategy-customization/
-
-    You can:
-        :return: a Dataframe with all mandatory indicators for the strategies
-    - Rename the class name (Do not forget to update class_name)
-    - Add any methods you want to build your strategy
-    - Add any lib you need to build your strategy
-
-    You must keep:
-    - the lib in the section "Do not remove these libs"
-    - the methods: populate_indicators, populate_entry_trend, populate_exit_trend
-    You should keep:
-    - timeframe, minimal_roi, stoploss, trailing_*
+    Capa 1: Detección de estructura SMC en 15m
+    Capa 2: Bias direccional desde 1h (HTF)
+    Capa 3: Filtro ML (próxima iteración)
     """
-    # Strategy interface version - allow new iterations of the strategy interface.
-    # Check the documentation or the Sample strategy to get the latest version.
+
+    # ── Configuración base ──────────────────────────────────────────────────
     INTERFACE_VERSION = 3
+    timeframe = '15m'
+    can_short = False  # solo long por ahora
 
-    # Optimal timeframe for the strategy.
-    timeframe = "5m"
-
-    # Can this strategy go short?
-    can_short: bool = False
-
-    # Minimal ROI designed for the strategy.
-    # This attribute will be overridden if the config file contains "minimal_roi".
+    # Gestión de riesgo — estándar institucional
     minimal_roi = {
-        "60": 0.01,
-        "30": 0.02,
-        "0": 0.04
+        "0":  0.03,    # 3% TP inmediato si se da
+        "30": 0.02,    # 2% después de 30 min
+        "60": 0.01,    # 1% después de 1h
+        "120": 0       # breakeven después de 2h
     }
+    stoploss = -0.02           # 2% stop loss máximo
+    trailing_stop = True
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.015
+    trailing_only_offset_is_reached = True
 
-    # Optimal stoploss designed for the strategy.
-    # This attribute will be overridden if the config file contains "stoploss".
-    stoploss = -0.10
-
-    # Trailing stoploss
-    trailing_stop = False
-    # trailing_only_offset_is_reached = False
-    # trailing_stop_positive = 0.01
-    # trailing_stop_positive_offset = 0.0  # Disabled / not configured
-
-    # Run "populate_indicators()" only for new candle.
+    # Freqtrade settings
+    startup_candle_count = 200  # velas necesarias para calcular indicadores
     process_only_new_candles = True
 
-    # These values can be overridden in the config.
-    use_exit_signal = True
-    exit_profit_only = False
-    ignore_roi_if_entry_signal = False
+    # ── Timeframe superior para bias direccional ─────────────────────────────
+    @informative('1h')
+    def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # Tendencia en 1h
+        dataframe['ema_20_1h'] = ta.trend.ema_indicator(dataframe['close'], window=20)
+        dataframe['ema_50_1h'] = ta.trend.ema_indicator(dataframe['close'], window=50)
+        dataframe['ema_200_1h'] = ta.trend.ema_indicator(dataframe['close'], window=200)
 
-    # Number of candles the strategy requires before producing valid signals
-    startup_candle_count: int = 30
+        # Bias: 1 = alcista, -1 = bajista, 0 = neutral
+        dataframe['htf_bias'] = 0
+        dataframe.loc[
+            (dataframe['ema_20_1h'] > dataframe['ema_50_1h']) &
+            (dataframe['ema_50_1h'] > dataframe['ema_200_1h']),
+            'htf_bias'
+        ] = 1
+        dataframe.loc[
+            (dataframe['ema_20_1h'] < dataframe['ema_50_1h']) &
+            (dataframe['ema_50_1h'] < dataframe['ema_200_1h']),
+            'htf_bias'
+        ] = -1
 
-    # Strategy parameters
-    buy_rsi = IntParameter(10, 40, default=30, space="buy")
-    sell_rsi = IntParameter(60, 90, default=70, space="sell")# Optional order type mapping.
-    order_types = {
-        "entry": "limit",
-        "exit": "limit",
-        "stoploss": "market",
-        "stoploss_on_exchange": False
-    }
+        # ATR para contexto de volatilidad
+        dataframe['atr_1h'] = ta.volatility.average_true_range(
+            dataframe['high'], dataframe['low'], dataframe['close'], window=14
+        )
+        return dataframe
 
-    # Optional order time in force.
-    order_time_in_force = {
-        "entry": "GTC",
-        "exit": "GTC"
-    }
-    @property
-    def plot_config(self):
-        return {
-            # Main plot indicators (Moving averages, ...)
-            "main_plot": {
-                "tema": {},
-                "sar": {"color": "white"},
-            },
-            "subplots": {
-                # Subplots - each dict defines one additional plot
-                "MACD": {
-                    "macd": {"color": "blue"},
-                    "macdsignal": {"color": "orange"},
-                },
-                "RSI": {
-                    "rsi": {"color": "red"},
-                }
-            }
-        }
-
-    def informative_pairs(self):
-        """
-        Define additional, informative pair/interval combinations to be cached from the exchange.
-        These pair/interval combinations are non-tradeable, unless they are part
-        of the whitelist as well.
-        For more information, please consult the documentation
-        :return: List of tuples in the format (pair, interval)
-            Sample: return [("ETH/USDT", "5m"),
-                            ("BTC/USDT", "15m"),
-                            ]
-        """
-        return []
-
+    # ── Indicadores principales (15m) ────────────────────────────────────────
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """
-        Adds several different TA indicators to the given DataFrame
 
-        Performance Note: For the best performance be frugal on the number of indicators
-        you are using. Let uncomment only the indicator you are using in your strategies
-        or your hyperopt configuration, otherwise you will waste your memory and CPU usage.
-        :param dataframe: Dataframe with data from the exchange
-        :param metadata: Additional information, like the currently traded pair
-        :return: a Dataframe with all mandatory indicators for the strategies
-        """
-        # Momentum Indicators
-        # ------------------------------------
+        # --- Tendencia 15m ---
+        dataframe['ema_9']   = ta.trend.ema_indicator(dataframe['close'], window=9)
+        dataframe['ema_21']  = ta.trend.ema_indicator(dataframe['close'], window=21)
+        dataframe['ema_50']  = ta.trend.ema_indicator(dataframe['close'], window=50)
+        dataframe['ema_200'] = ta.trend.ema_indicator(dataframe['close'], window=200)
 
-        # ADX
-        dataframe["adx"] = ta.ADX(dataframe)
+        # --- Momentum ---
+        dataframe['rsi'] = ta.momentum.rsi(dataframe['close'], window=14)
+        macd = ta.trend.MACD(dataframe['close'])
+        dataframe['macd']        = macd.macd()
+        dataframe['macd_signal'] = macd.macd_signal()
+        dataframe['macd_hist']   = macd.macd_diff()
 
-        # # Plus Directional Indicator / Movement
-        # dataframe["plus_dm"] = ta.PLUS_DM(dataframe)
-        # dataframe["plus_di"] = ta.PLUS_DI(dataframe)
-
-        # # Minus Directional Indicator / Movement
-        # dataframe["minus_dm"] = ta.MINUS_DM(dataframe)
-        # dataframe["minus_di"] = ta.MINUS_DI(dataframe)
-
-        # # Aroon, Aroon Oscillator
-        # aroon = ta.AROON(dataframe)
-        # dataframe["aroonup"] = aroon["aroonup"]
-        # dataframe["aroondown"] = aroon["aroondown"]
-        # dataframe["aroonosc"] = ta.AROONOSC(dataframe)
-
-        # # Awesome Oscillator
-        # dataframe["ao"] = qtpylib.awesome_oscillator(dataframe)
-
-        # # Keltner Channel
-        # keltner = qtpylib.keltner_channel(dataframe)
-        # dataframe["kc_upperband"] = keltner["upper"]
-        # dataframe["kc_lowerband"] = keltner["lower"]
-        # dataframe["kc_middleband"] = keltner["mid"]
-        # dataframe["kc_percent"] = (
-        #     (dataframe["close"] - dataframe["kc_lowerband"]) /
-        #     (dataframe["kc_upperband"] - dataframe["kc_lowerband"])
-        # )
-        # dataframe["kc_width"] = (
-        #     (dataframe["kc_upperband"] - dataframe["kc_lowerband"]) / dataframe["kc_middleband"]
-        # )
-
-        # # Ultimate Oscillator
-        # dataframe["uo"] = ta.ULTOSC(dataframe)
-
-        # # Commodity Channel Index: values [Oversold:-100, Overbought:100]
-        # dataframe["cci"] = ta.CCI(dataframe)
-
-        # RSI
-        dataframe["rsi"] = ta.RSI(dataframe)
-
-        # # Inverse Fisher transform on RSI: values [-1.0, 1.0] (https://goo.gl/2JGGoy)
-        # rsi = 0.1 * (dataframe["rsi"] - 50)
-        # dataframe["fisher_rsi"] = (np.exp(2 * rsi) - 1) / (np.exp(2 * rsi) + 1)
-
-        # # Inverse Fisher transform on RSI normalized: values [0.0, 100.0] (https://goo.gl/2JGGoy)
-        # dataframe["fisher_rsi_norma"] = 50 * (dataframe["fisher_rsi"] + 1)
-
-        # # Stochastic Slow
-        # stoch = ta.STOCH(dataframe)
-        # dataframe["slowd"] = stoch["slowd"]
-        # dataframe["slowk"] = stoch["slowk"]
-
-        # Stochastic Fast
-        stoch_fast = ta.STOCHF(dataframe)
-        dataframe["fastd"] = stoch_fast["fastd"]
-        dataframe["fastk"] = stoch_fast["fastk"]
-
-        # # Stochastic RSI
-        # Please read https://github.com/freqtrade/freqtrade/issues/2961 before using this.
-        # STOCHRSI is NOT aligned with tradingview, which may result in non-expected results.
-        # stoch_rsi = ta.STOCHRSI(dataframe)
-        # dataframe["fastd_rsi"] = stoch_rsi["fastd"]
-        # dataframe["fastk_rsi"] = stoch_rsi["fastk"]
-
-        # MACD
-        macd = ta.MACD(dataframe)
-        dataframe["macd"] = macd["macd"]
-        dataframe["macdsignal"] = macd["macdsignal"]
-        dataframe["macdhist"] = macd["macdhist"]
-
-        # MFI
-        dataframe["mfi"] = ta.MFI(dataframe)
-
-        # # ROC
-        # dataframe["roc"] = ta.ROC(dataframe)
-
-        # Overlap Studies
-        # ------------------------------------
-
-        # Bollinger Bands
-        bollinger = qtpylib.bollinger_bands(qtpylib.typical_price(dataframe), window=20, stds=2)
-        dataframe["bb_lowerband"] = bollinger["lower"]
-        dataframe["bb_middleband"] = bollinger["mid"]
-        dataframe["bb_upperband"] = bollinger["upper"]
-        dataframe["bb_percent"] = (
-            (dataframe["close"] - dataframe["bb_lowerband"]) /
-            (dataframe["bb_upperband"] - dataframe["bb_lowerband"])
+        # --- Volatilidad ---
+        dataframe['atr'] = ta.volatility.average_true_range(
+            dataframe['high'], dataframe['low'], dataframe['close'], window=14
         )
-        dataframe["bb_width"] = (
-            (dataframe["bb_upperband"] - dataframe["bb_lowerband"]) / dataframe["bb_middleband"]
-        )
+        bb = ta.volatility.BollingerBands(dataframe['close'], window=20, window_dev=2)
+        dataframe['bb_upper']  = bb.bollinger_hband()
+        dataframe['bb_lower']  = bb.bollinger_lband()
+        dataframe['bb_mid']    = bb.bollinger_mavg()
+        dataframe['bb_width']  = (dataframe['bb_upper'] - dataframe['bb_lower']) / dataframe['bb_mid']
 
-        # Bollinger Bands - Weighted (EMA based instead of SMA)
-        # weighted_bollinger = qtpylib.weighted_bollinger_bands(
-        #     qtpylib.typical_price(dataframe), window=20, stds=2
-        # )
-        # dataframe["wbb_upperband"] = weighted_bollinger["upper"]
-        # dataframe["wbb_lowerband"] = weighted_bollinger["lower"]
-        # dataframe["wbb_middleband"] = weighted_bollinger["mid"]
-        # dataframe["wbb_percent"] = (
-        #     (dataframe["close"] - dataframe["wbb_lowerband"]) /
-        #     (dataframe["wbb_upperband"] - dataframe["wbb_lowerband"])
-        # )
-        # dataframe["wbb_width"] = (
-        #     (dataframe["wbb_upperband"] - dataframe["wbb_lowerband"]) / dataframe["wbb_middleband"]
-        # )
+        # --- Volumen ---
+        dataframe['volume_ma_20'] = dataframe['volume'].rolling(20).mean()
+        dataframe['volume_ratio'] = dataframe['volume'] / dataframe['volume_ma_20']
 
-        # # EMA - Exponential Moving Average
-        # dataframe["ema3"] = ta.EMA(dataframe, timeperiod=3)
-        # dataframe["ema5"] = ta.EMA(dataframe, timeperiod=5)
-        # dataframe["ema10"] = ta.EMA(dataframe, timeperiod=10)
-        # dataframe["ema21"] = ta.EMA(dataframe, timeperiod=21)
-        # dataframe["ema50"] = ta.EMA(dataframe, timeperiod=50)
-        # dataframe["ema100"] = ta.EMA(dataframe, timeperiod=100)
-
-        # # SMA - Simple Moving Average
-        # dataframe["sma3"] = ta.SMA(dataframe, timeperiod=3)
-        # dataframe["sma5"] = ta.SMA(dataframe, timeperiod=5)
-        # dataframe["sma10"] = ta.SMA(dataframe, timeperiod=10)
-        # dataframe["sma21"] = ta.SMA(dataframe, timeperiod=21)
-        # dataframe["sma50"] = ta.SMA(dataframe, timeperiod=50)
-        # dataframe["sma100"] = ta.SMA(dataframe, timeperiod=100)
-
-        # Parabolic SAR
-        dataframe["sar"] = ta.SAR(dataframe)
-
-        # TEMA - Triple Exponential Moving Average
-        dataframe["tema"] = ta.TEMA(dataframe, timeperiod=9)
-
-        # Cycle Indicator
-        # ------------------------------------
-        # Hilbert Transform Indicator - SineWave
-        hilbert = ta.HT_SINE(dataframe)
-        dataframe["htsine"] = hilbert["sine"]
-        dataframe["htleadsine"] = hilbert["leadsine"]
-
-        # Pattern Recognition - Bullish candlestick patterns
-        # ------------------------------------
-        # # Hammer: values [0, 100]
-        # dataframe["CDLHAMMER"] = ta.CDLHAMMER(dataframe)
-        # # Inverted Hammer: values [0, 100]
-        # dataframe["CDLINVERTEDHAMMER"] = ta.CDLINVERTEDHAMMER(dataframe)
-        # # Dragonfly Doji: values [0, 100]
-        # dataframe["CDLDRAGONFLYDOJI"] = ta.CDLDRAGONFLYDOJI(dataframe)
-        # # Piercing Line: values [0, 100]
-        # dataframe["CDLPIERCING"] = ta.CDLPIERCING(dataframe) # values [0, 100]
-        # # Morningstar: values [0, 100]
-        # dataframe["CDLMORNINGSTAR"] = ta.CDLMORNINGSTAR(dataframe) # values [0, 100]
-        # # Three White Soldiers: values [0, 100]
-        # dataframe["CDL3WHITESOLDIERS"] = ta.CDL3WHITESOLDIERS(dataframe) # values [0, 100]
-
-        # Pattern Recognition - Bearish candlestick patterns
-        # ------------------------------------
-        # # Hanging Man: values [0, 100]
-        # dataframe["CDLHANGINGMAN"] = ta.CDLHANGINGMAN(dataframe)
-        # # Shooting Star: values [0, 100]
-        # dataframe["CDLSHOOTINGSTAR"] = ta.CDLSHOOTINGSTAR(dataframe)
-        # # Gravestone Doji: values [0, 100]
-        # dataframe["CDLGRAVESTONEDOJI"] = ta.CDLGRAVESTONEDOJI(dataframe)
-        # # Dark Cloud Cover: values [0, 100]
-        # dataframe["CDLDARKCLOUDCOVER"] = ta.CDLDARKCLOUDCOVER(dataframe)
-        # # Evening Doji Star: values [0, 100]
-        # dataframe["CDLEVENINGDOJISTAR"] = ta.CDLEVENINGDOJISTAR(dataframe)
-        # # Evening Star: values [0, 100]
-        # dataframe["CDLEVENINGSTAR"] = ta.CDLEVENINGSTAR(dataframe)
-
-        # Pattern Recognition - Bullish/Bearish candlestick patterns
-        # ------------------------------------
-        # # Three Line Strike: values [0, -100, 100]
-        # dataframe["CDL3LINESTRIKE"] = ta.CDL3LINESTRIKE(dataframe)
-        # # Spinning Top: values [0, -100, 100]
-        # dataframe["CDLSPINNINGTOP"] = ta.CDLSPINNINGTOP(dataframe) # values [0, -100, 100]
-        # # Engulfing: values [0, -100, 100]
-        # dataframe["CDLENGULFING"] = ta.CDLENGULFING(dataframe) # values [0, -100, 100]
-        # # Harami: values [0, -100, 100]
-        # dataframe["CDLHARAMI"] = ta.CDLHARAMI(dataframe) # values [0, -100, 100]
-        # # Three Outside Up/Down: values [0, -100, 100]
-        # dataframe["CDL3OUTSIDE"] = ta.CDL3OUTSIDE(dataframe) # values [0, -100, 100]
-        # # Three Inside Up/Down: values [0, -100, 100]
-        # dataframe["CDL3INSIDE"] = ta.CDL3INSIDE(dataframe) # values [0, -100, 100]
-
-        # # Chart type
-        # # ------------------------------------
-        # # Heikin Ashi Strategy
-        # heikinashi = qtpylib.heikinashi(dataframe)
-        # dataframe["ha_open"] = heikinashi["open"]
-        # dataframe["ha_close"] = heikinashi["close"]
-        # dataframe["ha_high"] = heikinashi["high"]
-        # dataframe["ha_low"] = heikinashi["low"]
-
-        # Retrieve best bid and best ask from the orderbook
-        # ------------------------------------
-        """
-        # first check if dataprovider is available
-        if self.dp:
-            if self.dp.runmode.value in ("live", "dry_run"):
-                ob = self.dp.orderbook(metadata["pair"], 1)
-                dataframe["best_bid"] = ob["bids"][0][0]
-                dataframe["best_ask"] = ob["asks"][0][0]
-        """
+        # ── SMC: Estructura de mercado ────────────────────────────────────────
+        dataframe = self._detect_swing_points(dataframe)
+        dataframe = self._detect_order_blocks(dataframe)
+        dataframe = self._detect_fvg(dataframe)
+        dataframe = self._detect_liquidity(dataframe)
+        dataframe = self._detect_kill_zone(dataframe)
+        dataframe = self._detect_bos(dataframe)
 
         return dataframe
 
+    # ── SMC: Swing Points ────────────────────────────────────────────────────
+    def _detect_swing_points(self, df: DataFrame, lookback: int = 5) -> DataFrame:
+        df['swing_high'] = (
+            (df['high'] == df['high'].rolling(lookback * 2 + 1, center=True).max())
+        ).astype(int)
+        df['swing_low'] = (
+            (df['low'] == df['low'].rolling(lookback * 2 + 1, center=True).min())
+        ).astype(int)
+
+        # Guardar niveles de swing para referencia
+        df['last_swing_high'] = df['high'].where(df['swing_high'] == 1).ffill()
+        df['last_swing_low']  = df['low'].where(df['swing_low'] == 1).ffill()
+        return df
+
+    # ── SMC: Break of Structure ──────────────────────────────────────────────
+    def _detect_bos(self, df: DataFrame) -> DataFrame:
+        df['bos_bullish'] = (
+            (df['close'] > df['last_swing_high'].shift(1)) &
+            (df['close'].shift(1) <= df['last_swing_high'].shift(1))
+        ).astype(int)
+
+        df['bos_bearish'] = (
+            (df['close'] < df['last_swing_low'].shift(1)) &
+            (df['close'].shift(1) >= df['last_swing_low'].shift(1))
+        ).astype(int)
+        return df
+
+    # ── SMC: Order Blocks ────────────────────────────────────────────────────
+    def _detect_order_blocks(self, df: DataFrame, lookback: int = 3) -> DataFrame:
+        body = abs(df['close'] - df['open'])
+        avg_body = body.rolling(20).mean()
+        impulse = body > avg_body * 1.5
+
+        # Bullish OB: vela bajista antes de impulso alcista
+        df['ob_bullish'] = (
+            (df['close'] < df['open']) &           # vela bajista
+            impulse.shift(-1) &                     # impulso en siguiente vela
+            (df['close'].shift(-1) > df['open'].shift(-1))  # siguiente es alcista
+        ).astype(int)
+
+        df['ob_bull_top']    = df['open'].where(df['ob_bullish'] == 1).ffill()
+        df['ob_bull_bottom'] = df['close'].where(df['ob_bullish'] == 1).ffill()
+
+        # Bearish OB: vela alcista antes de impulso bajista
+        df['ob_bearish'] = (
+            (df['close'] > df['open']) &
+            impulse.shift(-1) &
+            (df['close'].shift(-1) < df['open'].shift(-1))
+        ).astype(int)
+
+        df['ob_bear_top']    = df['close'].where(df['ob_bearish'] == 1).ffill()
+        df['ob_bear_bottom'] = df['open'].where(df['ob_bearish'] == 1).ffill()
+
+        return df
+
+    # ── SMC: Fair Value Gaps ─────────────────────────────────────────────────
+    def _detect_fvg(self, df: DataFrame) -> DataFrame:
+        # Bullish FVG: gap entre high de vela -1 y low de vela +1
+        df['fvg_bullish'] = (
+            df['high'].shift(1) < df['low'].shift(-1)
+        ).astype(int)
+
+        df['fvg_bull_bottom'] = df['high'].shift(1).where(df['fvg_bullish'] == 1).ffill()
+        df['fvg_bull_top']    = df['low'].shift(-1).where(df['fvg_bullish'] == 1).ffill()
+
+        # Bearish FVG
+        df['fvg_bearish'] = (
+            df['low'].shift(1) > df['high'].shift(-1)
+        ).astype(int)
+        return df
+
+    # ── SMC: Zonas de Liquidez ───────────────────────────────────────────────
+    def _detect_liquidity(self, df: DataFrame, tolerance: float = 0.001) -> DataFrame:
+        # Equal highs/lows en ventana de 20 velas
+        for i in range(20, len(df)):
+            window_highs = df['high'].iloc[i-20:i]
+            curr_high = df['high'].iloc[i]
+            equal_highs = (abs(window_highs - curr_high) / curr_high < tolerance).sum()
+            df.iloc[i, df.columns.get_loc('liquidity_high') if 'liquidity_high' in df.columns
+                    else df.columns.get_loc(df.columns[-1])] = (equal_highs >= 2)
+
+        df['liquidity_high'] = (
+            (df['high'].rolling(20).max() - df['high']).abs() / df['high'] < tolerance
+        ).astype(int)
+
+        df['liquidity_low'] = (
+            (df['low'].rolling(20).min() - df['low']).abs() / df['low'] < tolerance
+        ).astype(int)
+        return df
+
+    # ── SMC: Kill Zones (UTC) ────────────────────────────────────────────────
+    def _detect_kill_zone(self, df: DataFrame) -> DataFrame:
+        hour = df['date'].dt.hour if hasattr(df['date'], 'dt') else pd.to_datetime(df['date']).dt.hour
+
+        # London Open: 07:00-10:00 UTC
+        # NY Open: 12:00-15:00 UTC
+        df['in_kill_zone'] = (
+            ((hour >= 7) & (hour < 10)) |   # London Open
+            ((hour >= 12) & (hour < 15))     # NY Open
+        ).astype(int)
+
+        df['london_open'] = ((hour >= 7) & (hour < 10)).astype(int)
+        df['ny_open']     = ((hour >= 12) & (hour < 15)).astype(int)
+        return df
+
+    # ── Señal de entrada ─────────────────────────────────────────────────────
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """
-        Based on TA indicators, populates the entry signal for the given dataframe
-        :param dataframe: DataFrame
-        :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with entry columns populated
-        """
         dataframe.loc[
             (
-                (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)) &  # Signal: RSI crosses above buy_rsi
-                (dataframe["tema"] <= dataframe["bb_middleband"]) &  # Guard: tema below BB middle
-                (dataframe["tema"] > dataframe["tema"].shift(1)) &  # Guard: tema is raising
-                (dataframe["volume"] > 0)  # Make sure Volume is not 0
-            ),
-            "enter_long"] = 1
-        # Uncomment to use shorts (Only used in futures/margin mode. Check the documentation for more info)
-        """
-        dataframe.loc[
-            (
-                (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)) &  # Signal: RSI crosses above sell_rsi
-                (dataframe["tema"] > dataframe["bb_middleband"]) &  # Guard: tema above BB middle
-                (dataframe["tema"] < dataframe["tema"].shift(1)) &  # Guard: tema is falling
-                (dataframe['volume'] > 0)  # Make sure Volume is not 0
-            ),
-            'enter_short'] = 1
-        """
+                # 1. Bias HTF alcista
+                (dataframe['htf_bias_1h'] == 1) &
 
+                # 2. Break of Structure alcista confirmado
+                (dataframe['bos_bullish'] == 1) &
+
+                # 3. Precio retrocede a Order Block o FVG
+                (
+                    (dataframe['close'] <= dataframe['ob_bull_top']) |
+                    (dataframe['close'] <= dataframe['fvg_bull_top'])
+                ) &
+
+                # 4. RSI no sobrecomprado
+                (dataframe['rsi'] < 70) &
+                (dataframe['rsi'] > 30) &
+
+                # 5. En Kill Zone
+                (dataframe['in_kill_zone'] == 1) &
+
+                # 6. Volumen confirmando
+                (dataframe['volume_ratio'] > 1.2) &
+
+                # 7. Vela de confirmación alcista
+                (dataframe['close'] > dataframe['open']) &
+
+                # 8. Volumen presente
+                (dataframe['volume'] > 0)
+            ),
+            'enter_long'
+        ] = 1
         return dataframe
 
+    # ── Señal de salida ──────────────────────────────────────────────────────
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """
-        Based on TA indicators, populates the exit signal for the given dataframe
-        :param dataframe: DataFrame
-        :param metadata: Additional information, like the currently traded pair
-        :return: DataFrame with exit columns populated
-        """
         dataframe.loc[
             (
-                (qtpylib.crossed_above(dataframe["rsi"], self.sell_rsi.value)) &  # Signal: RSI crosses above sell_rsi
-                (dataframe["tema"] > dataframe["bb_middleband"]) &  # Guard: tema above BB middle
-                (dataframe["tema"] < dataframe["tema"].shift(1)) &  # Guard: tema is falling
-                (dataframe["volume"] > 0)  # Make sure Volume is not 0
+                # Salida: BOS bajista o RSI sobrecomprado o bias cambia
+                (dataframe['bos_bearish'] == 1) |
+                (dataframe['rsi'] > 80) |
+                (dataframe['htf_bias_1h'] == -1)
             ),
-            "exit_long"] = 1
-        # Uncomment to use shorts (Only used in futures/margin mode. Check the documentation for more info)
-        """
-        dataframe.loc[
-            (
-                (qtpylib.crossed_above(dataframe["rsi"], self.buy_rsi.value)) &  # Signal: RSI crosses above buy_rsi
-                (dataframe["tema"] <= dataframe["bb_middleband"]) &  # Guard: tema below BB middle
-                (dataframe["tema"] > dataframe["tema"].shift(1)) &  # Guard: tema is raising
-                (dataframe['volume'] > 0)  # Make sure Volume is not 0
-            ),
-            'exit_short'] = 1
-        """
+            'exit_long'
+        ] = 1
         return dataframe
