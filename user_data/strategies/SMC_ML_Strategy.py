@@ -115,7 +115,6 @@ class SMC_ML_Strategy(IStrategy):
         return dataframe
 
     def _detect_swing_points(self, df: DataFrame, lookback: int = 11) -> DataFrame:
-        # ✅ Solo hacia atrás — sin center=True
         df['swing_high'] = (
             df['high'] == df['high'].rolling(lookback).max()
         ).astype(int)
@@ -142,11 +141,10 @@ class SMC_ML_Strategy(IStrategy):
         avg_body = body.rolling(20).mean()
         impulse  = body > avg_body * 1.5
 
-        # ✅ Impulso en vela anterior — sin shift(-1)
         df['ob_bullish'] = (
-            (df['close'].shift(1) < df['open'].shift(1)) &  # vela anterior bajista
-            impulse &                                         # vela actual es el impulso
-            (df['close'] > df['open'])                        # vela actual alcista
+            (df['close'].shift(1) < df['open'].shift(1)) &
+            impulse &
+            (df['close'] > df['open'])
         ).astype(int)
         df['ob_bull_top']    = df['open'].shift(1).where(df['ob_bullish'] == 1).ffill()
         df['ob_bull_bottom'] = df['close'].shift(1).where(df['ob_bullish'] == 1).ffill()
@@ -161,15 +159,12 @@ class SMC_ML_Strategy(IStrategy):
         return df
 
     def _detect_fvg(self, df: DataFrame) -> DataFrame:
-        # ✅ FVG confirmado: gap entre vela -2 y vela actual (sin shift(-1))
-        # Bullish FVG: high de hace 2 velas < low de vela actual
         df['fvg_bullish'] = (
             df['high'].shift(2) < df['low']
         ).astype(int)
         df['fvg_bull_bottom'] = df['high'].shift(2).where(df['fvg_bullish'] == 1).ffill()
         df['fvg_bull_top']    = df['low'].where(df['fvg_bullish'] == 1).ffill()
 
-        # Bearish FVG: low de hace 2 velas > high de vela actual
         df['fvg_bearish'] = (
             df['low'].shift(2) > df['high']
         ).astype(int)
@@ -195,6 +190,10 @@ class SMC_ML_Strategy(IStrategy):
         return df
 
     def _compute_smc_features(self, df: DataFrame) -> DataFrame:
+        # ── Debug temporal: identificar columnas 1h disponibles ───────────────
+        cols_1h = [c for c in df.columns if '1h' in c]
+        print(f"🔍 Columnas con '1h': {cols_1h}")
+
         df['dist_to_ob'] = (
             (df['close'] - df['ob_bull_top']) / df['close']
         ).fillna(0)
@@ -202,9 +201,7 @@ class SMC_ML_Strategy(IStrategy):
             (df['ob_bull_top'] - df['ob_bull_bottom']) / df['close']
         ).fillna(0)
 
-        # Antigüedad del OB — vectorizada
-        ob_age = []
-        last_ob = np.nan
+        ob_age, last_ob = [], np.nan
         for i in range(len(df)):
             if df['ob_bullish'].iloc[i] == 1:
                 last_ob = i
@@ -223,8 +220,19 @@ class SMC_ML_Strategy(IStrategy):
         df['dist_to_swing_low'] = (
             (df['close'] - df['last_swing_low']) / df['close']
         ).fillna(0)
-        df['atr_norm']  = df['atr'] / df['close']
-        df['atr_ratio'] = df['atr'] / df['atr_1h'].replace(0, np.nan).ffill()
+        df['atr_norm'] = df['atr'] / df['close']
+
+        # ── atr_ratio: usar columna correcta del HTF ─────────────────────────
+        # Freqtrade inyecta columnas del @informative con sufijo _1h
+        # El nombre exacto se imprime arriba para verificación
+        atr_1h_col = 'atr_1h_1h' if 'atr_1h_1h' in df.columns else (
+                     'atr_1h'    if 'atr_1h'    in df.columns else None)
+
+        if atr_1h_col:
+            df['atr_ratio'] = df['atr'] / df[atr_1h_col].replace(0, np.nan).ffill()
+        else:
+            df['atr_ratio'] = 1.0  # fallback neutral
+
         return df
 
     def _compute_ml_score(self, df: DataFrame) -> DataFrame:
