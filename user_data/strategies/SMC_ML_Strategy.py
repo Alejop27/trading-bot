@@ -9,23 +9,20 @@ import pandas as pd
 from pandas import DataFrame
 from freqtrade.strategy import IStrategy, informative
 import ta
+import joblib
+import os
 
 class SMC_ML_Strategy(IStrategy):
-    """
-    Capa 1: Detección de estructura SMC en 15m
-    Capa 2: Bias direccional desde 1h (HTF)
-    Capa 3: Filtro ML (próxima iteración)
-    """
 
     INTERFACE_VERSION = 3
     timeframe = '15m'
     can_short = False
 
     minimal_roi = {
-        "0":  0.03,
-        "30": 0.02,
-        "60": 0.01,
-        "120": 0
+        "0":  0.02,
+        "15": 0.01,
+        "30": 0.005,
+        "60": 0
     }
     stoploss = -0.02
     trailing_stop = True
@@ -35,6 +32,19 @@ class SMC_ML_Strategy(IStrategy):
 
     startup_candle_count = 200
     process_only_new_candles = True
+
+    # ── Umbral ML: solo entra si score >= este valor ─────────────────────────
+    ml_score_threshold = 0.60
+    ml_model = None
+    ml_model_path = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_model.pkl')
+
+    def bot_start(self, **kwargs):
+        """Carga el modelo ML al arrancar. Si no existe, opera sin filtro."""
+        if os.path.exists(self.ml_model_path):
+            self.ml_model = joblib.load(self.ml_model_path)
+            print(f"✅ Modelo ML cargado: {self.ml_model_path}")
+        else:
+            print("⚠️  Modelo ML no encontrado. Operando sin filtro ML.")
 
     @informative('1h')
     def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -53,6 +63,17 @@ class SMC_ML_Strategy(IStrategy):
             (dataframe['ema_50_1h'] < dataframe['ema_200_1h']),
             'htf_bias'
         ] = -1
+
+        # ── Features continuas del HTF (tu Capa 1) ───────────────────────────
+        dataframe['htf_ema20_50_dist'] = (
+            (dataframe['ema_20_1h'] - dataframe['ema_50_1h']) / dataframe['ema_50_1h']
+        )
+        dataframe['htf_ema50_200_dist'] = (
+            (dataframe['ema_50_1h'] - dataframe['ema_200_1h']) / dataframe['ema_200_1h']
+        )
+        dataframe['htf_price_ema200_dist'] = (
+            (dataframe['close'] - dataframe['ema_200_1h']) / dataframe['ema_200_1h']
+        )
 
         dataframe['atr_1h'] = ta.volatility.average_true_range(
             dataframe['high'], dataframe['low'], dataframe['close'], window=14
@@ -83,12 +104,23 @@ class SMC_ML_Strategy(IStrategy):
         dataframe['volume_ma_20'] = dataframe['volume'].rolling(20).mean()
         dataframe['volume_ratio'] = dataframe['volume'] / dataframe['volume_ma_20']
 
+        # ── Z-score de volumen (tu sugerencia) ───────────────────────────────
+        vol_std = dataframe['volume'].rolling(50).std()
+        vol_mean = dataframe['volume'].rolling(50).mean()
+        dataframe['volume_zscore'] = (dataframe['volume'] - vol_mean) / vol_std
+
         dataframe = self._detect_swing_points(dataframe)
         dataframe = self._detect_order_blocks(dataframe)
         dataframe = self._detect_fvg(dataframe)
         dataframe = self._detect_liquidity(dataframe)
         dataframe = self._detect_kill_zone(dataframe)
         dataframe = self._detect_bos(dataframe)
+
+        # ── Features continuas SMC (tu Capa 2) ───────────────────────────────
+        dataframe = self._compute_smc_features(dataframe)
+
+        # ── Score ML ─────────────────────────────────────────────────────────
+        dataframe = self._compute_ml_score(dataframe)
 
         return dataframe
 
@@ -166,21 +198,126 @@ class SMC_ML_Strategy(IStrategy):
         df['ny_open']     = ((hour >= 12) & (hour < 15)).astype(int)
         return df
 
+    def _compute_smc_features(self, df: DataFrame) -> DataFrame:
+        """Features continuas SMC — tu Capa 2 y Capa 3."""
+
+        # Distancia al Order Block (normalizada)
+        df['dist_to_ob'] = (
+            (df['close'] - df['ob_bull_top']) / df['close']
+        ).fillna(0)
+
+        # Tamaño del Order Block
+        df['ob_size'] = (
+            (df['ob_bull_top'] - df['ob_bull_bottom']) / df['close']
+        ).fillna(0)
+
+        # Antigüedad del OB: velas desde el último OB
+        ob_indices = df.index[df['ob_bullish'] == 1].tolist()
+        df['ob_age'] = 999
+        for idx in df.index:
+            past_obs = [i for i in ob_indices if i <= idx]
+            if past_obs:
+                df.loc[idx, 'ob_age'] = idx - past_obs[-1]
+
+        # Distancia al FVG
+        df['dist_to_fvg'] = (
+            (df['close'] - df['fvg_bull_top']) / df['close']
+        ).fillna(0)
+
+        # Tamaño del FVG
+        df['fvg_size'] = (
+            (df['fvg_bull_top'] - df['fvg_bull_bottom']) / df['close']
+        ).fillna(0)
+
+        # Distancia a swing highs/lows (liquidez)
+        df['dist_to_swing_high'] = (
+            (df['last_swing_high'] - df['close']) / df['close']
+        ).fillna(0)
+        df['dist_to_swing_low'] = (
+            (df['close'] - df['last_swing_low']) / df['close']
+        ).fillna(0)
+
+        # ATR normalizado
+        df['atr_norm'] = df['atr'] / df['close']
+
+        # Ratio ATR 15m vs 1h
+        df['atr_ratio'] = df['atr'] / df['atr_1h'].replace(0, np.nan).ffill()
+
+        return df
+
+    def _compute_ml_score(self, df: DataFrame) -> DataFrame:
+        """Aplica el modelo ML y genera score de probabilidad de ROI."""
+        df['ml_score'] = 0.5  # default neutral si no hay modelo
+
+        if self.ml_model is None:
+            return df
+
+        feature_cols = self._get_feature_cols()
+        features = df[feature_cols].fillna(0)
+
+        try:
+            scores = self.ml_model.predict_proba(features)[:, 1]
+            df['ml_score'] = scores
+        except Exception as e:
+            print(f"⚠️  Error en ML score: {e}")
+
+        return df
+
+    def _get_feature_cols(self) -> list:
+        """Lista canónica de features para el modelo ML."""
+        return [
+            # Capa 1: Régimen HTF
+            'htf_bias_1h',
+            'htf_ema20_50_dist_1h',
+            'htf_ema50_200_dist_1h',
+            'htf_price_ema200_dist_1h',
+            # Capa 2: Estructura SMC continua
+            'dist_to_ob',
+            'ob_size',
+            'ob_age',
+            'dist_to_fvg',
+            'fvg_size',
+            # Capa 3: Liquidez
+            'dist_to_swing_high',
+            'dist_to_swing_low',
+            # Capa 4: Volumen
+            'volume_ratio',
+            'volume_zscore',
+            # Capa 5: Volatilidad
+            'atr_norm',
+            'atr_ratio',
+            'bb_width',
+            # Capa 6: Momento
+            'rsi',
+            'macd_hist',
+            # Contexto
+            'in_kill_zone',
+            'bos_bullish',
+        ]
+
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # Condición ML: si hay modelo usa el score, si no omite el filtro
+        ml_filter = (
+            (dataframe['ml_score'] >= self.ml_score_threshold)
+            if self.ml_model is not None
+            else True
+        )
+
         dataframe.loc[
             (
                 (dataframe['htf_bias_1h'] == 1) &
-                (dataframe['bos_bullish'] == 1) &
+                (dataframe['ema_9'] > dataframe['ema_21']) &
+                (dataframe['rsi'] > 25) &
+                (dataframe['rsi'] < 75) &
                 (
                     (dataframe['close'] <= dataframe['ob_bull_top']) |
-                    (dataframe['close'] <= dataframe['fvg_bull_top'])
+                    (dataframe['close'] <= dataframe['fvg_bull_top']) |
+                    (dataframe['close'] <= dataframe['ema_21'] * 1.005)
                 ) &
-                (dataframe['rsi'] < 70) &
-                (dataframe['rsi'] > 30) &
-                (dataframe['in_kill_zone'] == 1) &
-                (dataframe['volume_ratio'] > 1.2) &
+                (dataframe['volume_ratio'] > 0.8) &
                 (dataframe['close'] > dataframe['open']) &
-                (dataframe['volume'] > 0)
+                (dataframe['volume'] > 0) &
+                ml_filter
             ),
             'enter_long'
         ] = 1
@@ -190,7 +327,6 @@ class SMC_ML_Strategy(IStrategy):
         dataframe.loc[
             (
                 (dataframe['bos_bearish'] == 1) |
-                (dataframe['rsi'] > 80) |
                 (dataframe['htf_bias_1h'] == -1)
             ),
             'exit_long'
