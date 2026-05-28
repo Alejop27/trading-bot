@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SMC_ML_Strategy.py — v4 — Scaler fix + exit_signal repair
+# SMC_ML_Strategy.py — v6 — Anti-extension filter (scale fix)
 # Exchange: Bybit | Par: BTC/USDT | Timeframe: 15m
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -17,9 +17,6 @@ class SMC_ML_Strategy(IStrategy):
     timeframe = '15m'
     can_short = False
 
-    # ── ROI ampliado para capturar tendencias reales ──────────────────────────
-    # Antes: {0: 0.02, 15: 0.01, 30: 0.005, 60: 0}
-    # Problema: cortaba ganancias a +0.13% mientras las pérdidas llegaban -0.80%
     minimal_roi = {
         "0":   0.06,
         "60":  0.04,
@@ -32,10 +29,6 @@ class SMC_ML_Strategy(IStrategy):
     trailing_stop_positive = 0.01
     trailing_stop_positive_offset = 0.015
     trailing_only_offset_is_reached = True
-
-    # ── exit_signal deshabilitado ─────────────────────────────────────────────
-    # bos_bearish se disparaba demasiado frecuente → 129 trades a -0.80% avg
-    # = -$306 USDT. Reemplazado por lógica estructural más selectiva abajo.
     use_exit_signal = True
 
     startup_candle_count = 200
@@ -43,12 +36,11 @@ class SMC_ML_Strategy(IStrategy):
 
     ml_score_threshold = 0.62
     ml_model  = None
-    ml_scaler = None  # ← FIX: ahora cargamos el scaler también
+    ml_scaler = None
 
     ml_model_path  = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_model.pkl')
     ml_scaler_path = os.path.join(os.path.dirname(__file__), '..', 'ml_models', 'smc_ml_scaler.pkl')
 
-    # ── Fuente única de verdad — idéntica a train_model.py ───────────────────
     FEATURE_COLS = [
         'htf_bias_1h', 'htf_ema20_50_dist_1h',
         'htf_ema50_200_dist_1h', 'htf_price_ema200_dist_1h',
@@ -62,20 +54,15 @@ class SMC_ML_Strategy(IStrategy):
     ]
 
     def bot_start(self, **kwargs):
-        # ── FIX: cargar scaler junto con el modelo ────────────────────────────
         model_ok  = os.path.exists(self.ml_model_path)
         scaler_ok = os.path.exists(self.ml_scaler_path)
-
         if model_ok and scaler_ok:
             self.ml_model  = joblib.load(self.ml_model_path)
             self.ml_scaler = joblib.load(self.ml_scaler_path)
-            print(f"✅ Modelo ML cargado: {self.ml_model_path}")
-            print(f"✅ Scaler ML cargado: {self.ml_scaler_path}")
-        elif model_ok and not scaler_ok:
-            print("⚠️  Scaler no encontrado. Operando sin filtro ML.")
-            print(f"   Esperado en: {self.ml_scaler_path}")
+            print(f"✅ Modelo ML cargado")
+            print(f"✅ Scaler ML cargado")
         else:
-            print("⚠️  Modelo ML no encontrado. Operando sin filtro ML.")
+            print("⚠️  Modelo o scaler no encontrado. Operando sin filtro ML.")
 
     @informative('1h')
     def populate_indicators_1h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -246,37 +233,42 @@ class SMC_ML_Strategy(IStrategy):
         ).fillna(0)
         df['atr_norm']  = df['atr'] / df['close']
         df['atr_ratio'] = df['atr'] / df['atr_1h_1h'].replace(0, np.nan).ffill()
-
         return df
 
     def _compute_ml_score(self, df: DataFrame) -> DataFrame:
-        # Default neutro — ni filtra ni fuerza entradas
         df['ml_score'] = 0.5
-
         if self.ml_model is None or self.ml_scaler is None:
             return df
-
         try:
-            features = df[self.FEATURE_COLS].fillna(0)
-            # ── FIX CRÍTICO: aplicar scaler antes de predict_proba ────────────
-            # Sin esto el modelo recibe datos sin escalar y los scores son
-            # basura → el threshold 0.62 no filtra nada o filtra al azar.
+            features        = df[self.FEATURE_COLS].fillna(0)
             features_scaled = self.ml_scaler.transform(features)
-            df['ml_score'] = self.ml_model.predict_proba(features_scaled)[:, 1]
+            df['ml_score']  = self.ml_model.predict_proba(features_scaled)[:, 1]
         except Exception as e:
             print(f"⚠️  Error en ML score: {e}")
-
         return df
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # ── Filtro ML ─────────────────────────────────────────────────────────
-        # Si el modelo+scaler están cargados, aplicar umbral.
-        # Si no, bloquear todas las entradas (fail-safe conservador).
         if self.ml_model is not None and self.ml_scaler is not None:
             ml_filter = dataframe['ml_score'] >= self.ml_score_threshold
         else:
-            # Sin modelo no operamos — evita entrar "a ciegas"
             ml_filter = False
+
+        # ── Filtro anti-extensión ─────────────────────────────────────────────
+        # Análisis de 24 stops vs 67 winners (v4 backtest):
+        #   atr_norm:    stops=0.00445 | winners=0.00369 → threshold midpoint=0.0041
+        #   ema21_vs_50: stops=0.00411 | winners=0.00329 → threshold midpoint=0.0037
+        #
+        # Bug de escala corregido: versión anterior aplicaba *100 a valores que
+        # analyze_stops.py ya reportaba en % → producía 44.5/36.9 en runtime,
+        # threshold 0.40 rechazaba el 100% de entradas → 0 trades posibles.
+        #
+        # Ahora: atr_norm ya existe como fracción (atr/close) en el dataframe.
+        # ema21_vs_50 se calcula como fracción directa sin multiplicar.
+        ema21_vs_50  = ((dataframe['ema_21'] - dataframe['ema_50']) / dataframe['ema_50']).abs()
+        not_extended = (
+            (dataframe['atr_norm'] < 0.0041) &
+            (ema21_vs_50 < 0.0037)
+        )
 
         dataframe.loc[
             (
@@ -292,6 +284,7 @@ class SMC_ML_Strategy(IStrategy):
                 (dataframe['volume_ratio'] > 0.8) &
                 (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0) &
+                not_extended &
                 ml_filter
             ),
             'enter_long'
@@ -299,10 +292,6 @@ class SMC_ML_Strategy(IStrategy):
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # ── Exit estructural mejorado ─────────────────────────────────────────
-        # Antes: bos_bearish solo → demasiado frecuente → 129 trades a -0.80%
-        # Ahora: requiere AMBAS condiciones (BOS bearish + HTF bias cambiado)
-        # para salir. Esto deja correr trades buenos en pullbacks normales.
         dataframe.loc[
             (
                 (dataframe['bos_bearish'] == 1) &
