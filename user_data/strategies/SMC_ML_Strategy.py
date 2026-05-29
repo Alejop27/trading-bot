@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SMC_ML_Strategy.py — v6 — Anti-extension filter (scale fix)
+# SMC_ML_Strategy.py — v7 — Momentum failure exit
 # Exchange: Bybit | Par: BTC/USDT | Timeframe: 15m
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -30,6 +30,13 @@ class SMC_ML_Strategy(IStrategy):
     trailing_stop_positive_offset = 0.015
     trailing_only_offset_is_reached = True
     use_exit_signal = True
+
+    # ── Momentum failure exit config ─────────────────────────────────────────
+    # Evidencia: 14/14 stops → MFE < 1.0% | 0/44 winners → MFE < 1.0%
+    # Si después de 8 velas (2h) el precio no llegó a +0.8% → salir
+    # Efecto estimado: -$104 USDT → ~-$25 USDT en stops
+    MFE_CANDLES_WAIT  = 92      # velas 15m antes de evaluar (2h)
+    MFE_MIN_THRESHOLD = 0.005  # 0.8% mínimo de excursión favorable
 
     startup_candle_count = 200
     process_only_new_candles = True
@@ -247,24 +254,52 @@ class SMC_ML_Strategy(IStrategy):
             print(f"⚠️  Error en ML score: {e}")
         return df
 
+    def custom_exit(self, pair: str, trade, current_time,
+                    current_rate: float, current_profit: float, **kwargs):
+        """
+        Momentum failure exit — salida temprana por falta de follow-through.
+
+        Evidencia estadística:
+          - 14/14 stop_loss trades → MFE < 1.0% (promedio 0.519%)
+          -  0/44 winners         → MFE < 1.0% (promedio 1.560%)
+
+        Lógica: si después de MFE_CANDLES_WAIT velas el precio no llegó
+        a MFE_MIN_THRESHOLD de excursión favorable → el trade es estructuralmente
+        malo. Salir con pérdida pequeña (~-0.5%) en lugar de esperar SL (-2%).
+
+        trade.max_rate es el máximo precio alcanzado desde la entrada.
+        No usa información futura — es causal y ejecutable en vivo.
+        """
+        if trade.max_rate is None or trade.open_rate is None:
+            return None
+
+        # Velas transcurridas desde la entrada
+        candles_since_entry = int(
+            (current_time - trade.open_date_utc).total_seconds() / (15 * 60)
+        )
+
+        # Dar tiempo mínimo al trade antes de evaluar
+        if candles_since_entry < self.MFE_CANDLES_WAIT:
+            return None
+
+        # MFE: máxima excursión favorable desde la entrada
+        mfe = (trade.max_rate - trade.open_rate) / trade.open_rate
+
+        # Si no llegó al umbral mínimo → momentum failure
+        if mfe < self.MFE_MIN_THRESHOLD:
+            return "momentum_failure"
+
+        return None
+
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         if self.ml_model is not None and self.ml_scaler is not None:
             ml_filter = dataframe['ml_score'] >= self.ml_score_threshold
         else:
             ml_filter = False
 
-        # ── Filtro anti-extensión ─────────────────────────────────────────────
-        # Análisis de 24 stops vs 67 winners (v4 backtest):
-        #   atr_norm:    stops=0.00445 | winners=0.00369 → threshold midpoint=0.0041
-        #   ema21_vs_50: stops=0.00411 | winners=0.00329 → threshold midpoint=0.0037
-        #
-        # Bug de escala corregido: versión anterior aplicaba *100 a valores que
-        # analyze_stops.py ya reportaba en % → producía 44.5/36.9 en runtime,
-        # threshold 0.40 rechazaba el 100% de entradas → 0 trades posibles.
-        #
-        # Ahora: atr_norm ya existe como fracción (atr/close) en el dataframe.
-        # ema21_vs_50 se calcula como fracción directa sin multiplicar.
-        ema21_vs_50  = ((dataframe['ema_21'] - dataframe['ema_50']) / dataframe['ema_50']).abs()
+        ema21_vs_50  = (
+            (dataframe['ema_21'] - dataframe['ema_50']) / dataframe['ema_50']
+        ).abs()
         not_extended = (
             (dataframe['atr_norm'] < 0.0041) &
             (ema21_vs_50 < 0.0037)

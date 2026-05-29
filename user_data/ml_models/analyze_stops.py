@@ -1,4 +1,4 @@
-# analyze_stops.py — Autopsia completa: contexto de entrada + análisis trailing
+# analyze_stops.py — Autopsia completa: contexto de entrada + análisis trailing + distancia estructural
 import pandas as pd
 import numpy as np
 import json
@@ -7,11 +7,11 @@ import glob
 from pathlib import Path
 import ta
 
-BACKTEST_PATH    = Path("user_data/backtest_results")
-DATA_PATH        = Path("user_data/data/bybit")
-PAIR             = "BTC_USDT"
-TRAILING_OFFSET  = 0.015  # trailing_stop_positive_offset
-TRAILING_POSITIVE = 0.01  # trailing_stop_positive
+BACKTEST_PATH     = Path("user_data/backtest_results")
+DATA_PATH         = Path("user_data/data/bybit")
+PAIR              = "BTC_USDT"
+TRAILING_OFFSET   = 0.015
+TRAILING_POSITIVE = 0.01
 
 def load_trades():
     files = sorted(glob.glob(str(BACKTEST_PATH / "*.zip")))
@@ -152,25 +152,46 @@ if __name__ == "__main__":
     print(f"\n  ❌ Nunca llegaron al offset (+1.5%): {len(never_reached)} / {len(stops)}")
     print(f"     → El SL fijo de -2% los mató antes de tener profit real.")
     print(f"     → Solución potencial: SL más amplio o filtro de entrada más selectivo.")
-
     print(f"\n  ⚠️  Trailing activado pero no protegió: {len(trailing_failed)} / {len(stops)}")
     print(f"     → El precio llegó a +1.5% pero revirtió hasta tocar el SL.")
     print(f"     → Solución potencial: trailing más agresivo o salida por momentum.")
 
     if never_reached:
-        df_nr = pd.DataFrame(never_reached)
+        df_nr      = pd.DataFrame(never_reached)
         durations  = (df_nr["trade_duration"] / 60).tolist()
         excursions = [((t["max_rate"] - t["open_rate"]) / t["open_rate"] * 100) for _, t in df_nr.iterrows()]
         print(f"\n  Stats grupo 'nunca llegó':")
-        print(f"    Duración promedio:     {sum(durations)/len(durations):.1f}h")
+        print(f"    Duración promedio:      {sum(durations)/len(durations):.1f}h")
         print(f"    Max excursión promedio: {sum(excursions)/len(excursions):.3f}%")
         print(f"    Max excursión máxima:   {max(excursions):.3f}%")
 
     if trailing_failed:
-        df_tf = pd.DataFrame(trailing_failed)
+        df_tf      = pd.DataFrame(trailing_failed)
         durations  = (df_tf["trade_duration"] / 60).tolist()
         excursions = [((t["max_rate"] - t["open_rate"]) / t["open_rate"] * 100) for _, t in df_tf.iterrows()]
         print(f"\n  Stats grupo 'trailing fallido':")
-        print(f"    Duración promedio:     {sum(durations)/len(durations):.1f}h")
+        print(f"    Duración promedio:      {sum(durations)/len(durations):.1f}h")
         print(f"    Max excursión promedio: {sum(excursions)/len(excursions):.3f}%")
         print(f"    Max excursión máxima:   {max(excursions):.3f}%")
+
+    # ── Sección 3: Distancia estructural en entrada ───────────────────────────
+    print("\n\n" + "═" * 58)
+    print("  DISTANCIA ESTRUCTURAL AL ENTRAR")
+    print("═" * 58)
+
+    stops_raw   = trades[trades["exit_reason"] == "stop_loss"]
+    winners_raw = trades[trades["exit_reason"].isin(["roi", "trailing_stop_loss"])]
+
+    for label, group in [("Stop Loss", stops_raw), ("Winners", winners_raw)]:
+        excursion = (group["max_rate"] - group["open_rate"]) / group["open_rate"] * 100
+        sl_dist   = (group["open_rate"] - group["initial_stop_loss_abs"]) / group["open_rate"] * 100
+        rr_ratio  = excursion / sl_dist
+
+        print(f"\n  {label} ({len(group)} trades):")
+        print(f"    MFE promedio:              {excursion.mean():.3f}%")
+        print(f"    MFE máximo:                {excursion.max():.3f}%")
+        print(f"    Distancia SL inicial:      {sl_dist.mean():.3f}%")
+        print(f"    R/R realizado promedio:    {rr_ratio.mean():.3f}x")
+        print(f"    Trades con MFE > SL dist:  {(excursion > sl_dist).sum()} / {len(group)}")
+        print(f"    Trades con MFE < 0.5%:     {(excursion < 0.5).sum()} / {len(group)}")
+        print(f"    Trades con MFE < 1.0%:     {(excursion < 1.0).sum()} / {len(group)}")
